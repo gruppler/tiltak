@@ -498,7 +498,7 @@ pub struct Settings {
     pub komi: Komi,
 }
 
-enum DetailedGameResult {
+pub(crate) enum DetailedGameResult {
     WhiteRoadWin,
     BlackRoadWin,
     WhiteFlatWin,
@@ -1044,7 +1044,7 @@ impl<const S: usize> Position<S> {
             .map(|result| result.game_result())
     }
 
-    fn detailed_game_result(&self, group_data: &GroupData<S>) -> Option<DetailedGameResult> {
+    pub(crate) fn detailed_game_result(&self, group_data: &GroupData<S>) -> Option<DetailedGameResult> {
         let repetitions = self
             .hash_history
             .iter()

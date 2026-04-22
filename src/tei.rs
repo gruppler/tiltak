@@ -461,14 +461,32 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
         Some("nodes") => {
             let nodes = words.next().unwrap().parse::<u32>().unwrap();
             let mut nodes_searched: u32 = 0;
+            let mut should_stop = false;
 
             let start_time = P::current_time();
 
-            while tree.visits() < nodes {
+            while tree.visits() < nodes && !should_stop {
                 let Ok(_) = tree.select() else {
                     break;
                 };
                 nodes_searched += 1;
+                if nodes_searched % 1000 == 0 {
+                    P::yield_fn().await;
+                    match input.try_recv() {
+                        Ok(line) => match line.trim() {
+                            "stop" => {
+                                should_stop = true;
+                            }
+                            "quit" => return Some(TeiResult::Quit),
+                            "isready" => output("readyok"),
+                            _ => {}
+                        },
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Closed) => {
+                            return Some(TeiResult::NoInput);
+                        }
+                    }
+                }
                 if nodes_searched.is_power_of_two() && tree.visits() > 1 {
                     output(&info_string::<S, P>(&start_time, nodes_searched, tree));
                 }

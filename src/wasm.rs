@@ -6,11 +6,11 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::{
     ptn::{ptn_parser::parse_ptn, Game},
-    position::Position,
+    position::{DetailedGameResult, Position},
     tei,
     tinue_search::{ProofResult, ProofTree},
 };
-use board_game_traits::Position as PositionTrait;
+use board_game_traits::{Color, Position as PositionTrait};
 
 // Platform implementation for wasm using js_sys::Date for timing
 
@@ -20,7 +20,19 @@ impl tei::Platform for WasmPlatform {
     type Instant = f64; // milliseconds from js_sys::Date::now()
 
     fn yield_fn() -> impl std::future::Future {
-        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::UNDEFINED))
+        // Promise.resolve() only yields to microtasks; onmessage fires as a
+        // macrotask, so "stop" would never be received. setTimeout(0) yields
+        // to macrotasks, letting the message event deliver "stop" first.
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let global = js_sys::global();
+            let set_timeout = js_sys::Reflect::get(&global, &"setTimeout".into())
+                .unwrap();
+            let set_timeout: js_sys::Function = set_timeout.unchecked_into();
+            set_timeout
+                .call2(&JsValue::UNDEFINED, &resolve, &JsValue::from(0))
+                .unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise)
     }
 
     fn current_time() -> f64 {
@@ -71,6 +83,7 @@ pub fn annotate_ptn(ptn: &str, tinue_nodes: Option<u32>) -> Result<String, JsVal
         4 => annotate_sized::<4>(ptn, nodes),
         5 => annotate_sized::<5>(ptn, nodes),
         6 => annotate_sized::<6>(ptn, nodes),
+        7 => annotate_sized::<7>(ptn, nodes),
         _ => Err(JsValue::from_str(&format!("Unsupported board size: {size}"))),
     }
 }
@@ -86,6 +99,7 @@ pub fn is_tak(tps: &str, size: usize) -> Result<bool, JsValue> {
         4 => is_tak_sized::<4>(tps),
         5 => is_tak_sized::<5>(tps),
         6 => is_tak_sized::<6>(tps),
+        7 => is_tak_sized::<7>(tps),
         _ => Err(JsValue::from_str(&format!("Unsupported board size: {size}"))),
     }
 }
@@ -101,6 +115,7 @@ pub fn is_tinue(tps: &str, size: usize, max_nodes: u32) -> Result<Option<bool>, 
         4 => is_tinue_sized::<4>(tps, max_nodes),
         5 => is_tinue_sized::<5>(tps, max_nodes),
         6 => is_tinue_sized::<6>(tps, max_nodes),
+        7 => is_tinue_sized::<7>(tps, max_nodes),
         _ => Err(JsValue::from_str(&format!("Unsupported board size: {size}"))),
     }
 }
@@ -118,7 +133,30 @@ fn is_tak_sized<const S: usize>(tps: &str) -> Result<bool, JsValue> {
         return Ok(false);
     }
     position.null_move();
-    Ok(position.has_winning_move())
+    Ok(has_road_win(&mut position))
+}
+
+/// Policy-free road-win check: returns true if the current side to move has any
+/// legal move that immediately wins by road (not flat count).
+/// This avoids `generate_moves_with_probabilities` / `Policy`, which panics for S=7.
+fn has_road_win<const S: usize>(position: &mut Position<S>) -> bool {
+    let mover = position.side_to_move();
+    let mut moves = vec![];
+    position.generate_moves(&mut moves);
+    for mv in moves {
+        let reverse = position.do_move(mv);
+        let group_data = position.group_data();
+        let result = position.detailed_game_result(&group_data);
+        position.reverse_move(reverse);
+        let road_win = match mover {
+            Color::White => matches!(result, Some(DetailedGameResult::WhiteRoadWin)),
+            Color::Black => matches!(result, Some(DetailedGameResult::BlackRoadWin)),
+        };
+        if road_win {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_tinue_sized<const S: usize>(tps: &str, max_nodes: u32) -> Result<Option<bool>, JsValue> {
@@ -192,7 +230,7 @@ fn annotate_sized<const S: usize>(ptn: &str, tinue_nodes: u32) -> Result<String,
 
             let annotation = if proof_tree.result() == Some(ProofResult::Proved) {
                 Some("\"") // tinue
-            } else if check_pos.has_winning_move() {
+            } else if has_road_win(&mut check_pos) {
                 Some("'") // tak
             } else {
                 None
