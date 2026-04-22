@@ -75,6 +75,72 @@ pub fn annotate_ptn(ptn: &str, tinue_nodes: Option<u32>) -> Result<String, JsVal
     }
 }
 
+/// Check whether the position described by `tps` is "in tak" — the player who
+/// just moved has an immediate winning road move available on their next turn.
+/// `size` must be 4, 5, or 6.
+/// Returns `true` if the position is in tak, `false` otherwise.
+/// Returns an error if the TPS string cannot be parsed.
+#[wasm_bindgen]
+pub fn is_tak(tps: &str, size: usize) -> Result<bool, JsValue> {
+    match size {
+        4 => is_tak_sized::<4>(tps),
+        5 => is_tak_sized::<5>(tps),
+        6 => is_tak_sized::<6>(tps),
+        _ => Err(JsValue::from_str(&format!("Unsupported board size: {size}"))),
+    }
+}
+
+/// Check whether the position described by `tps` is tinue — the player who
+/// just moved has a forced road win regardless of the opponent's play.
+/// `max_nodes` limits the proof-search budget; higher values are more accurate
+/// but slower. Returns `null` if the result could not be determined within
+/// the node budget.
+#[wasm_bindgen]
+pub fn is_tinue(tps: &str, size: usize, max_nodes: u32) -> Result<Option<bool>, JsValue> {
+    match size {
+        4 => is_tinue_sized::<4>(tps, max_nodes),
+        5 => is_tinue_sized::<5>(tps, max_nodes),
+        6 => is_tinue_sized::<6>(tps, max_nodes),
+        _ => Err(JsValue::from_str(&format!("Unsupported board size: {size}"))),
+    }
+}
+
+fn parse_position<const S: usize>(tps: &str) -> Result<Position<S>, JsValue> {
+    // Komi is irrelevant for road-win detection; parse with komi 0.
+    use crate::position::Komi;
+    Position::<S>::from_fen_with_komi(tps, Komi::default())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn is_tak_sized<const S: usize>(tps: &str) -> Result<bool, JsValue> {
+    let mut position = parse_position::<S>(tps)?;
+    if position.game_result().is_some() {
+        return Ok(false);
+    }
+    position.null_move();
+    Ok(position.has_winning_move())
+}
+
+fn is_tinue_sized<const S: usize>(tps: &str, max_nodes: u32) -> Result<Option<bool>, JsValue> {
+    let mut position = parse_position::<S>(tps)?;
+    if position.game_result().is_some() {
+        return Ok(Some(false));
+    }
+    position.null_move();
+    let mut proof_tree = ProofTree::new(position);
+    for _ in 0..max_nodes {
+        proof_tree.select();
+        if proof_tree.result().is_some() {
+            break;
+        }
+    }
+    Ok(match proof_tree.result() {
+        Some(ProofResult::Proved) => Some(true),
+        Some(ProofResult::Disproved) => Some(false),
+        None => None,
+    })
+}
+
 fn extract_size(ptn: &str) -> Result<usize, JsValue> {
     for line in ptn.lines() {
         let trimmed = line.trim();
