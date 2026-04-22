@@ -35,6 +35,10 @@ async fn tei_game<const S: usize, Out: Fn(&str), P: Platform>(
         Position::<S>::start_position_with_komi(options.komi),
         mcts_settings.clone(),
     );
+    // Accumulated search time on the current `search_tree`. Reset whenever the
+    // tree is rebuilt (not rerooted), so reused trees report a monotonic
+    // `time` field to the GUI (see PTN-Ninja suggestion filtering).
+    let mut cumulative_search_time: Duration = Duration::ZERO;
 
     while let Ok(line) = input.recv().await {
         let mut words = line.split_whitespace();
@@ -63,6 +67,7 @@ async fn tei_game<const S: usize, Out: Fn(&str), P: Platform>(
                     Position::<S>::start_position_with_komi(options.komi),
                     mcts_settings.clone().add_hash_megabytes(options.hash),
                 );
+                cumulative_search_time = Duration::ZERO;
             }
             "position" => {
                 position = Some(parse_position_string::<S>(&line, options.komi));
@@ -73,31 +78,39 @@ async fn tei_game<const S: usize, Out: Fn(&str), P: Platform>(
                     process::exit(1);
                 };
 
-                search_tree = update_search_tree(
+                let (new_tree, tree_reused) = update_search_tree(
                     &last_position_searched,
                     current_position,
                     search_tree,
                     &mcts_settings,
                 );
+                search_tree = new_tree;
+                if !tree_reused {
+                    cumulative_search_time = Duration::ZERO;
+                }
 
                 last_position_searched.clone_from(current_position);
 
-                match parse_go_string::<S, _, P>(
+                let go_start = P::current_time();
+                let go_result = parse_go_string::<S, _, P>(
                     input,
                     output,
                     &line,
                     current_position,
                     &mut search_tree,
+                    cumulative_search_time,
                     options,
                 )
-                .await
-                {
+                .await;
+                cumulative_search_time += P::elapsed_time(&go_start);
+                match go_result {
                     // Respond to OOM as if we received 'teinewgame'
                     // This will drop the whole search tree immediately
                     Some(TeiResult::Oom) => {
                         // If we faced OOM, deallocate the search tree,
                         // since receiving further tei inputs requires further memory allocation
                         search_tree.reset_tree(&current_position.position(), mcts_settings.clone());
+                        cumulative_search_time = Duration::ZERO;
                     }
                     Some(TeiResult::Quit) => return TeiResult::Quit,
                     Some(TeiResult::NoInput) => return TeiResult::NoInput,
@@ -284,18 +297,28 @@ impl<const S: usize> SearchPosition<S> {
     }
 }
 
+/// Returns the updated search tree and a flag indicating whether the previous
+/// tree was reused (by rerooting). When `false`, callers should reset any
+/// accumulators (node counts, time) tied to the previous tree.
 fn update_search_tree<const S: usize>(
     old_position: &SearchPosition<S>,
     new_position: &SearchPosition<S>,
     search_tree: MonteCarloTree<S>,
     mcts_settings: &MctsSetting<S>,
-) -> MonteCarloTree<S> {
+) -> (MonteCarloTree<S>, bool) {
     if let Some(move_difference) = old_position.move_difference(new_position) {
-        search_tree
-            .reroot(move_difference)
-            .unwrap_or_else(|| MonteCarloTree::new(new_position.position(), mcts_settings.clone()))
+        match search_tree.reroot(move_difference) {
+            Some(tree) => (tree, true),
+            None => (
+                MonteCarloTree::new(new_position.position(), mcts_settings.clone()),
+                false,
+            ),
+        }
     } else {
-        MonteCarloTree::new(new_position.position(), mcts_settings.clone())
+        (
+            MonteCarloTree::new(new_position.position(), mcts_settings.clone()),
+            false,
+        )
     }
 }
 
@@ -333,6 +356,7 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
     line: &str,
     position: &SearchPosition<S>,
     tree: &mut MonteCarloTree<S>,
+    time_offset: Duration,
     options: &Options,
 ) -> Option<TeiResult> {
     let mut words = line.split_whitespace();
@@ -387,10 +411,13 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
 
                 // Must not allocate memory here, because we may be in an OOM situation
                 if options.multi_pv > 1 {
+                    let tree_visits = tree.visits();
                     for (index, edge) in tree.best_moves().take(options.multi_pv).enumerate() {
                         let info_string = info_string_from_shallow_edge::<S, P>(
                             &start_time,
+                            time_offset,
                             nodes_searched,
+                            tree_visits,
                             edge,
                             index,
                         );
@@ -398,7 +425,8 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
                         output(&info_string);
                     }
                 } else {
-                    let info_string = info_string::<S, P>(&start_time, nodes_searched, tree);
+                    let info_string =
+                        info_string::<S, P>(&start_time, time_offset, nodes_searched, tree);
                     output(&info_string);
                 }
 
@@ -450,7 +478,8 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
 
             tree.search_for_time(max_time, |tree| {
                 let nodes_searched = tree.visits() - nodes_searched_previously;
-                let info_string = info_string::<S, P>(&start_time, nodes_searched, tree);
+                let info_string =
+                    info_string::<S, P>(&start_time, time_offset, nodes_searched, tree);
 
                 output(&info_string);
             });
@@ -488,11 +517,17 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
                     }
                 }
                 if nodes_searched.is_power_of_two() && tree.visits() > 1 {
-                    output(&info_string::<S, P>(&start_time, nodes_searched, tree));
+                    output(&info_string::<S, P>(
+                        &start_time,
+                        time_offset,
+                        nodes_searched,
+                        tree,
+                    ));
                 }
             }
 
-            let info_string = info_string::<S, P>(&start_time, nodes_searched, tree);
+            let info_string =
+                info_string::<S, P>(&start_time, time_offset, nodes_searched, tree);
 
             output(&info_string);
 
@@ -509,6 +544,7 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
 
 pub fn info_string<const S: usize, P: Platform>(
     start_time: &P::Instant,
+    time_offset: Duration,
     nodes_searched: u32,
     tree: &MonteCarloTree<S>,
 ) -> ArrayString<1024> {
@@ -518,6 +554,8 @@ pub fn info_string<const S: usize, P: Platform>(
 
     // Avoid NaN nps
     let elapsed = P::elapsed_time(start_time).max(Duration::from_micros(1));
+    // `time` is cumulative across reused trees; `nps` uses only this go's work.
+    let reported_time = time_offset + elapsed;
 
     let pv_length = tree.pv().count();
 
@@ -533,7 +571,7 @@ pub fn info_string<const S: usize, P: Platform>(
         (wdl[0] * 1000.0).round() as i64,
         (wdl[1] * 1000.0).round() as i64,
         (wdl[2] * 1000.0).round() as i64,
-        elapsed.as_millis(),
+        reported_time.as_millis(),
         nodes_searched as f32 / elapsed.as_secs_f32(),
     )
     .unwrap();
@@ -614,29 +652,36 @@ impl Options {
 
 pub fn info_string_from_shallow_edge<const S: usize, P: Platform>(
     start_time: &P::Instant,
+    time_offset: Duration,
     nodes_searched: u32,
+    tree_visits: u32,
     edge: ShallowEdge<'_, S>,
     pv_index: usize,
 ) -> ArrayString<1024> {
     let score = 1.0 - edge.mean_action_value;
     let wdl = [score, 0.0, 1.0 - score];
     let elapsed = P::elapsed_time(start_time).max(Duration::from_micros(1));
+    // `time` is cumulative across reused trees; `nps` uses only this go's work.
+    let reported_time = time_offset + elapsed;
 
     let pv_length = edge.pv().map(|pv| pv.count()).unwrap_or_default();
 
     let mut info_string = ArrayString::new();
 
+    // `nodes` reports the cumulative tree size (matches the single-PV path)
+    // so that tree reuse across `go` commands doesn't cause the node count
+    // to regress; `nps` is still based on nodes_searched since this `go`.
     write!(info_string, "info multipv {} depth {} seldepth {} nodes {} visits {} score cp {} wdl {} {} {} time {} nps {:.0} pv {}",
         pv_index + 1,
         ((edge.visits as f64 / 10.0).log2()) as u64,
         pv_length,
-        nodes_searched,
+        tree_visits,
         edge.visits,
         (score * 200.0 - 100.0) as i64,
         (wdl[0] * 1000.0).round() as i64,
         (wdl[1] * 1000.0).round() as i64,
         (wdl[2] * 1000.0).round() as i64,
-        elapsed.as_millis(),
+        reported_time.as_millis(),
         nodes_searched as f32 / elapsed.as_secs_f32(),
         edge.mv
     ).unwrap();
