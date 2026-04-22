@@ -305,7 +305,7 @@ impl<const S: usize> Position<S> {
 
     // Never inline, for profiling purposes
     #[inline(never)]
-    fn has_winning_move(&mut self) -> bool {
+    pub fn has_winning_move(&mut self) -> bool {
         let mut simple_moves = vec![];
         let mut moves = vec![];
         let mut fcd_per_move = vec![];

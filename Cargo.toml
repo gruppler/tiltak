@@ -12,12 +12,19 @@ default-run = "main"
 debug = true
 lto = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [features]
 default = ["mimalloc"]
 constant-tuning = ["rayon"]
 aws-lambda-runtime = ["lambda_runtime", "serde", "serde_json", "arrayvec/serde", "tokio"]
 sqlite = ["rusqlite", "rayon"]
 dhat-heap = ["dhat"]
+wasm = ["wasm-bindgen", "js-sys", "wasm-bindgen-futures"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
 
 [[bin]]
 name = "main"
@@ -64,3 +71,9 @@ async-channel = "2.5.0"
 mimalloc = {version = "0.1.47", optional = true }
 dhat = { version = "0.3.3", optional = true }
 trybox = "0.1.2"
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

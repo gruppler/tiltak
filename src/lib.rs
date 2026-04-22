@@ -52,3 +52,5 @@ pub mod tune;
 pub mod evaluation;
 pub mod ptn;
 pub mod tei;
+#[cfg(feature = "wasm")]
+pub mod wasm;
