@@ -410,25 +410,14 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
                 }
 
                 // Must not allocate memory here, because we may be in an OOM situation
-                if options.multi_pv > 1 {
-                    let tree_visits = tree.visits();
-                    for (index, edge) in tree.best_moves().take(options.multi_pv).enumerate() {
-                        let info_string = info_string_from_shallow_edge::<S, P>(
-                            &start_time,
-                            time_offset,
-                            nodes_searched,
-                            tree_visits,
-                            edge,
-                            index,
-                        );
-
-                        output(&info_string);
-                    }
-                } else {
-                    let info_string =
-                        info_string::<S, P>(&start_time, time_offset, nodes_searched, tree);
-                    output(&info_string);
-                }
+                emit_info::<S, P, _>(
+                    output,
+                    &start_time,
+                    time_offset,
+                    nodes_searched,
+                    tree,
+                    options.multi_pv,
+                );
 
                 if oom || should_stop {
                     let (best_move, _) = tree.best_move().unwrap();
@@ -478,10 +467,14 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
 
             tree.search_for_time(max_time, |tree| {
                 let nodes_searched = tree.visits() - nodes_searched_previously;
-                let info_string =
-                    info_string::<S, P>(&start_time, time_offset, nodes_searched, tree);
-
-                output(&info_string);
+                emit_info::<S, P, _>(
+                    output,
+                    &start_time,
+                    time_offset,
+                    nodes_searched,
+                    tree,
+                    options.multi_pv,
+                );
             });
             let best_move = tree.best_move().unwrap().0;
 
@@ -517,19 +510,25 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
                     }
                 }
                 if nodes_searched.is_power_of_two() && tree.visits() > 1 {
-                    output(&info_string::<S, P>(
+                    emit_info::<S, P, _>(
+                        output,
                         &start_time,
                         time_offset,
                         nodes_searched,
                         tree,
-                    ));
+                        options.multi_pv,
+                    );
                 }
             }
 
-            let info_string =
-                info_string::<S, P>(&start_time, time_offset, nodes_searched, tree);
-
-            output(&info_string);
+            emit_info::<S, P, _>(
+                output,
+                &start_time,
+                time_offset,
+                nodes_searched,
+                tree,
+                options.multi_pv,
+            );
 
             let (best_move, _) = tree.best_move().unwrap();
 
@@ -540,6 +539,38 @@ async fn parse_go_string<const S: usize, Out: Fn(&str), P: Platform>(
         }
     }
     None
+}
+
+/// Emit one or more `info` lines for the current tree state.
+///
+/// Emits a single best-PV `info` line when `multi_pv == 1` (no `multipv` token),
+/// or `multi_pv` `info multipv N …` lines (one per best edge) otherwise. Must
+/// not allocate, since callers may invoke this from an OOM path.
+pub fn emit_info<const S: usize, P: Platform, Out: Fn(&str)>(
+    output: &Out,
+    start_time: &P::Instant,
+    time_offset: Duration,
+    nodes_searched: u32,
+    tree: &MonteCarloTree<S>,
+    multi_pv: usize,
+) {
+    if multi_pv > 1 {
+        let tree_visits = tree.visits();
+        for (index, edge) in tree.best_moves().take(multi_pv).enumerate() {
+            let info_string = info_string_from_shallow_edge::<S, P>(
+                start_time,
+                time_offset,
+                nodes_searched,
+                tree_visits,
+                edge,
+                index,
+            );
+            output(&info_string);
+        }
+    } else {
+        let info_string = info_string::<S, P>(start_time, time_offset, nodes_searched, tree);
+        output(&info_string);
+    }
 }
 
 pub fn info_string<const S: usize, P: Platform>(
