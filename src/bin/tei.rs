@@ -29,12 +29,14 @@ pub fn main() {
     println!("id name Tiltak");
     println!("id author Morten Lohne");
     println!("option name HalfKomi type spin default 0 min -10 max 10");
+    println!("option name MultiPV type spin default 1 min 1 max 8");
     println!("teiok");
 
     // Position stored in a `dyn Any` variable, because it can be any size
     let mut position: Option<Box<dyn Any>> = None;
     let mut size: Option<usize> = None;
     let mut komi = Komi::default();
+    let mut multi_pv: usize = 1;
     let mut calculating_handle: Option<JoinHandle<()>> = None;
     let should_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
@@ -57,25 +59,37 @@ pub fn main() {
             }
             "isready" => println!("readyok"),
             "setoption" => {
-                if [
+                let header = [
                     words.next().unwrap_or_default(),
                     words.next().unwrap_or_default(),
-                    words.next().unwrap_or_default(),
-                ]
-                .join(" ")
-                    == "name HalfKomi value"
-                {
-                    if let Some(k) = words
-                        .next()
-                        .and_then(|komi_string| komi_string.parse::<i8>().ok())
-                        .and_then(Komi::from_half_komi)
-                    {
-                        komi = k;
-                    } else {
-                        panic!("Invalid komi setting \"{}\"", line);
-                    }
-                } else {
+                ];
+                if header != ["name", "HalfKomi"] && header != ["name", "MultiPV"] {
                     panic!("Invalid setoption string \"{}\"", line);
+                }
+                let option_name = header[1];
+                if words.next() != Some("value") {
+                    panic!("Invalid setoption string \"{}\"", line);
+                }
+                let value = words.next().unwrap_or_default();
+                match option_name {
+                    "HalfKomi" => {
+                        if let Some(k) =
+                            value.parse::<i8>().ok().and_then(Komi::from_half_komi)
+                        {
+                            komi = k;
+                        } else {
+                            panic!("Invalid komi setting \"{}\"", line);
+                        }
+                    }
+                    "MultiPV" => {
+                        if let Some(n) = value.parse::<usize>().ok().filter(|&n| (1..=8).contains(&n))
+                        {
+                            multi_pv = n;
+                        } else {
+                            panic!("Invalid MultiPV setting \"{}\"", line);
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
             "teinewgame" => {
@@ -114,6 +128,7 @@ pub fn main() {
                                 should_stop_clone,
                                 is_slatebot,
                                 is_cobblebot,
+                                multi_pv,
                             )
                         }))
                     }
@@ -130,6 +145,7 @@ pub fn main() {
                                 should_stop_clone,
                                 is_slatebot,
                                 is_cobblebot,
+                                multi_pv,
                             )
                         }))
                     }
@@ -146,6 +162,7 @@ pub fn main() {
                                 should_stop_clone,
                                 is_slatebot,
                                 is_cobblebot,
+                                multi_pv,
                             )
                         }))
                     }
@@ -162,6 +179,7 @@ pub fn main() {
                                 should_stop_clone,
                                 is_slatebot,
                                 is_cobblebot,
+                                multi_pv,
                             )
                         }))
                     }
@@ -198,12 +216,74 @@ fn parse_position_string<const S: usize>(line: &str, komi: Komi) -> Position<S> 
     position
 }
 
+fn print_search_info<const S: usize>(
+    tree: &MonteCarloTree<S>,
+    position: &Position<S>,
+    start_time: Instant,
+    multi_pv: usize,
+) {
+    let elapsed = start_time.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    let nps = tree.visits() as f32 / elapsed.as_secs_f32();
+    let depth = ((tree.visits() as f64 / 10.0).log2()) as u64;
+    let total_visits = tree.visits();
+
+    if multi_pv > 1 {
+        for (index, edge) in tree.best_moves(multi_pv).iter().enumerate() {
+            let score = 1.0 - edge.mean_action_value;
+            let wdl = [score, 0.0, 1.0 - score];
+            let pv_moves: Vec<_> = std::iter::once(edge.mv)
+                .chain(tree.pv_from_edge(edge))
+                .collect();
+            println!(
+                "info multipv {} depth {} seldepth {} nodes {} score cp {} wdl {} {} {} time {} nps {:.0} pv {}",
+                index + 1,
+                depth,
+                pv_moves.len(),
+                total_visits,
+                (score * 200.0 - 100.0) as i64,
+                (wdl[0] * 1000.0).round() as i64,
+                (wdl[1] * 1000.0).round() as i64,
+                (wdl[2] * 1000.0).round() as i64,
+                elapsed_ms,
+                nps,
+                pv_moves
+                    .iter()
+                    .map(|mv| position.move_to_san(mv))
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            );
+        }
+    } else {
+        let best_score = tree.best_move().unwrap().1;
+        let wdl = [best_score, 0.0, 1.0 - best_score];
+        let pv: Vec<_> = tree.pv().collect();
+        println!(
+            "info depth {} seldepth {} nodes {} score cp {} wdl {} {} {} time {} nps {:.0} pv {}",
+            depth,
+            pv.len(),
+            total_visits,
+            (best_score * 200.0 - 100.0) as i64,
+            (wdl[0] * 1000.0).round() as i64,
+            (wdl[1] * 1000.0).round() as i64,
+            (wdl[2] * 1000.0).round() as i64,
+            elapsed_ms,
+            nps,
+            pv.iter()
+                .map(|mv| position.move_to_san(mv))
+                .collect::<Vec<String>>()
+                .join(" ")
+        );
+    }
+}
+
 fn parse_go_string<const S: usize>(
     line: &str,
     position: Position<S>,
     should_stop: Arc<AtomicBool>,
     is_slatebot: bool,
     is_cobblebot: bool,
+    multi_pv: usize,
 ) {
     let mut words = line.split_whitespace();
     words.next(); // go
@@ -244,21 +324,8 @@ fn parse_go_string<const S: usize>(
                         break;
                     }
                 }
-                let (best_move, best_score) = tree.best_move().unwrap();
-                let pv: Vec<_> = tree.pv().collect();
-                println!(
-                    "info depth {} seldepth {} nodes {} score cp {} time {} nps {:.0} pv {}",
-                    ((tree.visits() as f64 / 10.0).log2()) as u64,
-                    pv.len(),
-                    tree.visits(),
-                    (best_score * 200.0 - 100.0) as i64,
-                    start_time.elapsed().as_millis(),
-                    tree.visits() as f32 / start_time.elapsed().as_secs_f32(),
-                    pv.iter()
-                        .map(|mv| position.move_to_san(mv))
-                        .collect::<Vec<String>>()
-                        .join(" ")
-                );
+                let (best_move, _) = tree.best_move().unwrap();
+                print_search_info(&tree, &position, start_time, multi_pv);
                 if oom
                     || should_stop.load(atomic::Ordering::Relaxed)
                     || start_time.elapsed().as_secs_f64() > movetime.as_secs_f64() * 0.7
@@ -300,21 +367,7 @@ fn parse_go_string<const S: usize>(
 
             let mut tree = MonteCarloTree::new(position.clone(), mcts_settings);
             tree.search_for_time(max_time, |tree| {
-                let best_score = tree.best_move().unwrap().1;
-                let pv: Vec<_> = tree.pv().collect();
-                println!(
-                    "info depth {} seldepth {} nodes {} score cp {} time {} nps {:.0} pv {}",
-                    ((tree.visits() as f64 / 10.0).log2()) as u64,
-                    pv.len(),
-                    tree.visits(),
-                    (best_score * 200.0 - 100.0) as i64,
-                    start_time.elapsed().as_millis(),
-                    tree.visits() as f32 / start_time.elapsed().as_secs_f32(),
-                    pv.iter()
-                        .map(|mv| position.move_to_san(mv))
-                        .collect::<Vec<String>>()
-                        .join(" ")
-                );
+                print_search_info(tree, &position, start_time, multi_pv);
             });
             let best_move = tree.best_move().unwrap().0;
 

@@ -380,6 +380,20 @@ impl<const S: usize> MonteCarloTree<S> {
         Pv::new(&self.tree, &self.arena)
     }
 
+    pub fn pv_from_edge<'a>(
+        &'a self,
+        edge: &ShallowEdge<'a, S>,
+    ) -> impl Iterator<Item = Move<S>> + 'a {
+        Pv::new(edge.child, &self.arena)
+    }
+
+    pub fn best_moves(&self, n: usize) -> Vec<ShallowEdge<'_, S>> {
+        let mut edges = self.shallow_edges().unwrap_or_default();
+        edges.sort_by_key(|edge| std::cmp::Reverse(edge.visits));
+        edges.truncate(n);
+        edges
+    }
+
     /// Print human-readable information of the search's progress.
     pub fn print_info(&self) {
         let mut best_children: Vec<ShallowEdge<S>> = self.shallow_edges().unwrap_or_default();
@@ -471,9 +485,9 @@ impl<const S: usize> MonteCarloTree<S> {
 }
 // More convenient edge representation, allowing them to be stored as array-of-structs rather than struct-of-arrays
 pub struct ShallowEdge<'a, const S: usize> {
-    visits: u32,
-    mv: Move<S>,
-    mean_action_value: f32,
+    pub visits: u32,
+    pub mv: Move<S>,
+    pub mean_action_value: f32,
     child: &'a TreeEdge<S>,
     policy: f16,
 }
