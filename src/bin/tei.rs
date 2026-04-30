@@ -2,6 +2,7 @@
 
 use board_game_traits::{Color, Position as PositionTrait};
 use pgn_traits::PgnPosition;
+use std::any::Any;
 use std::io::{BufRead, BufReader};
 use std::str::FromStr;
 use std::sync::atomic::{self, AtomicBool};
@@ -9,10 +10,49 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{env, io};
-use tiltak::position::{Komi, Position};
 
-use std::any::Any;
-use tiltak::search::{self, MctsSetting, MonteCarloTree};
+use tiltak::position::{Komi, Move, Position};
+use tiltak::search::{MctsSetting, MonteCarloTree};
+
+/// Tracks the current "search position" as a root + a list of applied moves so
+/// that a new `position` command can be detected as a descendant of the
+/// previous one, allowing us to reroot the existing search tree instead of
+/// rebuilding from scratch.
+#[derive(Clone)]
+struct SearchPosition<const S: usize> {
+    root_position: Position<S>,
+    moves: Vec<Move<S>>,
+}
+
+impl<const S: usize> SearchPosition<S> {
+    fn position(&self) -> Position<S> {
+        let mut position = self.root_position.clone();
+        for mv in &self.moves {
+            position.do_move(*mv);
+        }
+        position
+    }
+
+    /// Returns the moves needed to reach `new_position` from `self` if
+    /// `new_position` is a descendant; otherwise `None`.
+    fn move_difference<'a>(
+        &self,
+        new_position: &'a SearchPosition<S>,
+    ) -> Option<&'a [Move<S>]> {
+        if self.root_position != new_position.root_position {
+            return None;
+        }
+        if new_position.moves.len() < self.moves.len() {
+            return None;
+        }
+        for (a, b) in self.moves.iter().zip(new_position.moves.iter()) {
+            if a != b {
+                return None;
+            }
+        }
+        Some(&new_position.moves[self.moves.len()..])
+    }
+}
 
 pub fn main() {
     let is_slatebot = env::args().any(|arg| arg == "--slatebot");
@@ -32,12 +72,20 @@ pub fn main() {
     println!("option name MultiPV type spin default 1 min 1 max 8");
     println!("teiok");
 
-    // Position stored in a `dyn Any` variable, because it can be any size
+    // Size-erased state — concrete types depend on the current `size`.
+    // `position` / `last_searched` hold `SearchPosition<S>`.
+    // `search_tree` holds `MonteCarloTree<S>`.
+    // `calculating_handle` returns `(Box<MonteCarloTree<S>>, Duration)` size-erased
+    // via `Box<dyn Any + Send>`; the `Duration` is the time actually spent in
+    // this `go` and is added to `cumulative_search_time` on join.
     let mut position: Option<Box<dyn Any>> = None;
+    let mut last_searched: Option<Box<dyn Any>> = None;
+    let mut search_tree: Option<Box<dyn Any + Send>> = None;
     let mut size: Option<usize> = None;
     let mut komi = Komi::default();
     let mut multi_pv: usize = 1;
-    let mut calculating_handle: Option<JoinHandle<()>> = None;
+    let mut cumulative_search_time = Duration::ZERO;
+    let mut calculating_handle: Option<JoinHandle<(Box<dyn Any + Send>, Duration)>> = None;
     let should_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     for line in BufReader::new(io::stdin()).lines().map(Result::unwrap) {
@@ -52,9 +100,11 @@ pub fn main() {
             }
             "stop" => {
                 should_stop.store(true, atomic::Ordering::Relaxed);
-                if let Some(handle) = calculating_handle.take() {
-                    handle.join().unwrap();
-                }
+                drain_worker(
+                    &mut calculating_handle,
+                    &mut search_tree,
+                    &mut cumulative_search_time,
+                );
                 should_stop.store(false, atomic::Ordering::Relaxed);
             }
             "isready" => println!("readyok"),
@@ -93,9 +143,17 @@ pub fn main() {
                 }
             }
             "teinewgame" => {
+                drain_worker(
+                    &mut calculating_handle,
+                    &mut search_tree,
+                    &mut cumulative_search_time,
+                );
                 let size_string = words.next();
                 size = size_string.and_then(|s| usize::from_str(s).ok());
                 position = None;
+                last_searched = None;
+                search_tree = None;
+                cumulative_search_time = Duration::ZERO;
 
                 match size {
                     Some(4) | Some(5) | Some(6) | Some(7) => (),
@@ -103,6 +161,11 @@ pub fn main() {
                 }
             }
             "position" => {
+                drain_worker(
+                    &mut calculating_handle,
+                    &mut search_tree,
+                    &mut cumulative_search_time,
+                );
                 position = match size {
                     None => panic!("Received position without receiving teinewgame string"),
                     Some(4) => Some(Box::new(parse_position_string::<4>(&line, komi))),
@@ -113,76 +176,57 @@ pub fn main() {
                 }
             }
             "go" => {
+                drain_worker(
+                    &mut calculating_handle,
+                    &mut search_tree,
+                    &mut cumulative_search_time,
+                );
                 let should_stop_clone = should_stop.clone();
                 calculating_handle = match size {
-                    Some(4) => {
-                        let position = position
-                            .as_ref()
-                            .and_then(|p| p.downcast_ref::<Position<4>>())
-                            .unwrap()
-                            .clone();
-                        Some(thread::spawn(move || {
-                            parse_go_string::<4>(
-                                &line,
-                                position,
-                                should_stop_clone,
-                                is_slatebot,
-                                is_cobblebot,
-                                multi_pv,
-                            )
-                        }))
-                    }
-                    Some(5) => {
-                        let position = position
-                            .as_ref()
-                            .and_then(|p| p.downcast_ref::<Position<5>>())
-                            .unwrap()
-                            .clone();
-                        Some(thread::spawn(move || {
-                            parse_go_string::<5>(
-                                &line,
-                                position,
-                                should_stop_clone,
-                                is_slatebot,
-                                is_cobblebot,
-                                multi_pv,
-                            )
-                        }))
-                    }
-                    Some(6) => {
-                        let position = position
-                            .as_ref()
-                            .and_then(|p| p.downcast_ref::<Position<6>>())
-                            .unwrap()
-                            .clone();
-                        Some(thread::spawn(move || {
-                            parse_go_string::<6>(
-                                &line,
-                                position,
-                                should_stop_clone,
-                                is_slatebot,
-                                is_cobblebot,
-                                multi_pv,
-                            )
-                        }))
-                    }
-                    Some(7) => {
-                        let position = position
-                            .as_ref()
-                            .and_then(|p| p.downcast_ref::<Position<7>>())
-                            .unwrap()
-                            .clone();
-                        Some(thread::spawn(move || {
-                            parse_go_string::<7>(
-                                &line,
-                                position,
-                                should_stop_clone,
-                                is_slatebot,
-                                is_cobblebot,
-                                multi_pv,
-                            )
-                        }))
-                    }
+                    Some(4) => Some(spawn_go::<4>(
+                        line.clone(),
+                        &mut position,
+                        &mut last_searched,
+                        &mut search_tree,
+                        &mut cumulative_search_time,
+                        is_slatebot,
+                        is_cobblebot,
+                        should_stop_clone,
+                        multi_pv,
+                    )),
+                    Some(5) => Some(spawn_go::<5>(
+                        line.clone(),
+                        &mut position,
+                        &mut last_searched,
+                        &mut search_tree,
+                        &mut cumulative_search_time,
+                        is_slatebot,
+                        is_cobblebot,
+                        should_stop_clone,
+                        multi_pv,
+                    )),
+                    Some(6) => Some(spawn_go::<6>(
+                        line.clone(),
+                        &mut position,
+                        &mut last_searched,
+                        &mut search_tree,
+                        &mut cumulative_search_time,
+                        is_slatebot,
+                        is_cobblebot,
+                        should_stop_clone,
+                        multi_pv,
+                    )),
+                    Some(7) => Some(spawn_go::<7>(
+                        line.clone(),
+                        &mut position,
+                        &mut last_searched,
+                        &mut search_tree,
+                        &mut cumulative_search_time,
+                        is_slatebot,
+                        is_cobblebot,
+                        should_stop_clone,
+                        multi_pv,
+                    )),
                     Some(s) => panic!("Error: Unsupported size {}", s),
                     None => panic!("Error: Received go without receiving teinewgame string"),
                 };
@@ -192,10 +236,115 @@ pub fn main() {
     }
 }
 
-fn parse_position_string<const S: usize>(line: &str, komi: Komi) -> Position<S> {
+fn build_mcts_settings<const S: usize>(is_slatebot: bool, is_cobblebot: bool) -> MctsSetting<S> {
+    if is_slatebot {
+        MctsSetting::default()
+            .add_rollout_depth(200)
+            .add_rollout_temperature(0.2)
+    } else if is_cobblebot {
+        MctsSetting::default()
+            .add_rollout_depth(200)
+            .add_rollout_temperature(0.2)
+            .add_dirichlet(0.25)
+    } else {
+        MctsSetting::default()
+    }
+}
+
+/// Drain the worker if running, recovering the tree and the time it actually
+/// spent searching (used to advance `cumulative_search_time` monotonically
+/// across reused trees).
+fn drain_worker(
+    handle: &mut Option<JoinHandle<(Box<dyn Any + Send>, Duration)>>,
+    search_tree: &mut Option<Box<dyn Any + Send>>,
+    cumulative: &mut Duration,
+) {
+    if let Some(h) = handle.take() {
+        let (tree_box, elapsed) = h.join().unwrap();
+        *search_tree = Some(tree_box);
+        *cumulative += elapsed;
+    }
+}
+
+/// Build / reroot the search tree for the next `go` command and spawn the
+/// worker thread. Updates `last_searched` and resets `cumulative_search_time`
+/// when the tree had to be rebuilt.
+#[allow(clippy::too_many_arguments)]
+fn spawn_go<const S: usize>(
+    line: String,
+    position: &mut Option<Box<dyn Any>>,
+    last_searched: &mut Option<Box<dyn Any>>,
+    search_tree: &mut Option<Box<dyn Any + Send>>,
+    cumulative_search_time: &mut Duration,
+    is_slatebot: bool,
+    is_cobblebot: bool,
+    should_stop: Arc<AtomicBool>,
+    multi_pv: usize,
+) -> JoinHandle<(Box<dyn Any + Send>, Duration)> {
+    let mcts_settings: MctsSetting<S> = build_mcts_settings(is_slatebot, is_cobblebot);
+    let cur_pos: SearchPosition<S> = position
+        .as_ref()
+        .and_then(|p| p.downcast_ref::<SearchPosition<S>>())
+        .expect("position must be set before go")
+        .clone();
+
+    let prev_tree = search_tree
+        .take()
+        .and_then(|b| b.downcast::<MonteCarloTree<S>>().ok())
+        .map(|b| *b);
+    let prev_pos = last_searched
+        .take()
+        .and_then(|b| b.downcast::<SearchPosition<S>>().ok())
+        .map(|b| *b);
+
+    let (tree, reused) = match (prev_tree, prev_pos) {
+        (Some(t), Some(prev)) => match prev.move_difference(&cur_pos) {
+            Some(diff) => match t.reroot(diff) {
+                Some(t) => (t, true),
+                None => (
+                    MonteCarloTree::new(cur_pos.position(), mcts_settings.clone()),
+                    false,
+                ),
+            },
+            None => (
+                MonteCarloTree::new(cur_pos.position(), mcts_settings.clone()),
+                false,
+            ),
+        },
+        _ => (
+            MonteCarloTree::new(cur_pos.position(), mcts_settings.clone()),
+            false,
+        ),
+    };
+
+    if !reused {
+        *cumulative_search_time = Duration::ZERO;
+    }
+
+    *last_searched = Some(Box::new(cur_pos.clone()));
+
+    let time_offset = *cumulative_search_time;
+    let position_for_worker = cur_pos.position();
+
+    thread::spawn(move || {
+        let go_start = Instant::now();
+        let tree = run_go::<S>(
+            &line,
+            position_for_worker,
+            tree,
+            should_stop,
+            multi_pv,
+            time_offset,
+        );
+        let elapsed = go_start.elapsed();
+        (Box::new(tree) as Box<dyn Any + Send>, elapsed)
+    })
+}
+
+fn parse_position_string<const S: usize>(line: &str, komi: Komi) -> SearchPosition<S> {
     let mut words_iter = line.split_whitespace();
     words_iter.next(); // position
-    let mut position = match words_iter.next() {
+    let root_position = match words_iter.next() {
         Some("startpos") => Position::start_position_with_komi(komi),
         Some("tps") => {
             let tps: String = (&mut words_iter).take(3).collect::<Vec<_>>().join(" ");
@@ -204,29 +353,40 @@ fn parse_position_string<const S: usize>(line: &str, komi: Komi) -> Position<S> 
         _ => panic!("Expected \"startpos\" or \"tps\" to specify position."),
     };
 
+    let mut moves: Vec<Move<S>> = Vec::new();
     match words_iter.next() {
         Some("moves") => {
+            // Replay moves on a scratch position so we can parse SAN against the running state.
+            let mut scratch = root_position.clone();
             for move_string in words_iter {
-                position.do_move(position.move_from_san(move_string).unwrap());
+                let mv = scratch.move_from_san(move_string).unwrap();
+                scratch.do_move(mv);
+                moves.push(mv);
             }
         }
         Some(s) => panic!("Expected \"moves\" in \"{}\", got \"{}\".", line, s),
         None => (),
     }
-    position
+    SearchPosition {
+        root_position,
+        moves,
+    }
 }
 
 fn print_search_info<const S: usize>(
     tree: &MonteCarloTree<S>,
     position: &Position<S>,
     start_time: Instant,
+    time_offset: Duration,
+    visits_at_start: u32,
     multi_pv: usize,
 ) {
-    let elapsed = start_time.elapsed();
-    let elapsed_ms = elapsed.as_millis();
-    let nps = tree.visits() as f32 / elapsed.as_secs_f32();
-    let depth = ((tree.visits() as f64 / 10.0).log2()) as u64;
+    let elapsed = start_time.elapsed().max(Duration::from_micros(1));
+    let reported_time_ms = (time_offset + elapsed).as_millis();
     let total_visits = tree.visits();
+    let nodes_this_go = total_visits.saturating_sub(visits_at_start);
+    let nps = nodes_this_go as f32 / elapsed.as_secs_f32();
+    let depth = ((total_visits as f64 / 10.0).log2()) as u64;
 
     if multi_pv > 1 {
         for (index, edge) in tree.best_moves(multi_pv).iter().enumerate() {
@@ -245,7 +405,7 @@ fn print_search_info<const S: usize>(
                 (wdl[0] * 1000.0).round() as i64,
                 (wdl[1] * 1000.0).round() as i64,
                 (wdl[2] * 1000.0).round() as i64,
-                elapsed_ms,
+                reported_time_ms,
                 nps,
                 pv_moves
                     .iter()
@@ -267,7 +427,7 @@ fn print_search_info<const S: usize>(
             (wdl[0] * 1000.0).round() as i64,
             (wdl[1] * 1000.0).round() as i64,
             (wdl[2] * 1000.0).round() as i64,
-            elapsed_ms,
+            reported_time_ms,
             nps,
             pv.iter()
                 .map(|mv| position.move_to_san(mv))
@@ -277,39 +437,27 @@ fn print_search_info<const S: usize>(
     }
 }
 
-fn parse_go_string<const S: usize>(
+fn run_go<const S: usize>(
     line: &str,
     position: Position<S>,
+    mut tree: MonteCarloTree<S>,
     should_stop: Arc<AtomicBool>,
-    is_slatebot: bool,
-    is_cobblebot: bool,
     multi_pv: usize,
-) {
+    time_offset: Duration,
+) -> MonteCarloTree<S> {
     let mut words = line.split_whitespace();
     words.next(); // go
 
-    let mcts_settings = if is_slatebot {
-        MctsSetting::default()
-            .add_rollout_depth(200)
-            .add_rollout_temperature(0.2)
-    } else if is_cobblebot {
-        MctsSetting::default()
-            .add_rollout_depth(200)
-            .add_rollout_temperature(0.2)
-            .add_dirichlet(0.25)
-    } else {
-        MctsSetting::default()
-    };
+    let visits_at_start = tree.visits();
 
     match words.next() {
         Some(word @ "movetime") | Some(word @ "infinite") => {
             let movetime = if word == "movetime" {
                 Duration::from_millis(u64::from_str(words.next().unwrap()).unwrap())
             } else {
-                Duration::MAX // 'go infinite' is just movetime with a very long duration
+                Duration::MAX
             };
             let start_time = Instant::now();
-            let mut tree = search::MonteCarloTree::new(position.clone(), mcts_settings);
 
             for i in 0.. {
                 let nodes_to_search = (200.0 * f64::powf(1.26, i as f64)) as u64;
@@ -325,7 +473,14 @@ fn parse_go_string<const S: usize>(
                     }
                 }
                 let (best_move, _) = tree.best_move().unwrap();
-                print_search_info(&tree, &position, start_time, multi_pv);
+                print_search_info(
+                    &tree,
+                    &position,
+                    start_time,
+                    time_offset,
+                    visits_at_start,
+                    multi_pv,
+                );
                 if oom
                     || should_stop.load(atomic::Ordering::Relaxed)
                     || start_time.elapsed().as_secs_f64() > movetime.as_secs_f64() * 0.7
@@ -365,9 +520,15 @@ fn parse_go_string<const S: usize>(
 
             let start_time = Instant::now();
 
-            let mut tree = MonteCarloTree::new(position.clone(), mcts_settings);
             tree.search_for_time(max_time, |tree| {
-                print_search_info(tree, &position, start_time, multi_pv);
+                print_search_info(
+                    tree,
+                    &position,
+                    start_time,
+                    time_offset,
+                    visits_at_start,
+                    multi_pv,
+                );
             });
             let best_move = tree.best_move().unwrap().0;
 
@@ -377,4 +538,7 @@ fn parse_go_string<const S: usize>(
             panic!("Invalid go command \"{}\"", line);
         }
     }
+
+    tree
 }
+

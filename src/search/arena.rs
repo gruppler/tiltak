@@ -10,6 +10,12 @@ use std::{
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
+// SAFETY: `data` is a unique heap allocation owned by this Arena. No other
+// thread holds aliasing references; transferring ownership across threads is safe.
+// We don't impl Sync — the get_mut methods on `&self` rely on caller-side
+// uniqueness and would be unsound from multiple threads simultaneously.
+unsafe impl<const S: usize> Send for Arena<S> {}
+
 pub struct Arena<const S: usize = 16> {
     data: *mut u8,
     orig_pointer: *mut u8,
@@ -41,6 +47,13 @@ impl<const S: usize> fmt::Debug for Arena<S> {
 pub struct Index<T> {
     data: NonZeroU32,
     phantom: PhantomData<T>,
+}
+
+impl<T> Copy for Index<T> {}
+impl<T> Clone for Index<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<T> Index<T> {

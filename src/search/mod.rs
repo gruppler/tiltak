@@ -2,6 +2,7 @@
 //!
 //! This implementation does not use full Monte Carlo rollouts, relying on a heuristic evaluation when expanding new nodes instead.
 
+use board_game_traits::Position as _;
 use half::f16;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -354,6 +355,45 @@ impl<const S: usize> MonteCarloTree<S> {
     // TODO: Count up to u64 on root?
     pub fn visits(&self) -> u32 {
         self.visits
+    }
+
+    pub fn position(&self) -> &Position<S> {
+        &self.position
+    }
+
+    /// Walk `moves` from the current root, rebinding the tree's root edge to the matching child.
+    /// Old subtree slots remain in the arena as dead memory; the next tree-rebuild reclaims them.
+    /// Returns `None` if any move is not represented in the tree (e.g. an unexplored edge).
+    pub fn reroot(self, moves: &[Move<S>]) -> Option<Self> {
+        let mut new_edge = self.tree;
+        let mut new_visits = self.visits;
+        let mut position = self.position;
+        for mv in moves {
+            let child_index = new_edge.child?;
+            let child = self.arena.get(&child_index);
+            let bridge_index = child.children.as_ref()?;
+            let bridge = self.arena.get(bridge_index);
+            let moves_slice = self.arena.get_slice(&bridge.moves);
+            let i = moves_slice.iter().position(|m| *m == Some(*mv))?;
+            let edges_slice = self.arena.get_slice(&bridge.children);
+            let visits_slice = self.arena.get_slice(&bridge.visitss);
+            new_edge = TreeEdge {
+                child: edges_slice[i].child,
+            };
+            new_visits = visits_slice[i];
+            position.do_move(*mv);
+        }
+        let mut temp_position = self.temp_position;
+        temp_position.clone_from(&position);
+        Some(Self {
+            tree: new_edge,
+            visits: new_visits,
+            position,
+            temp_position,
+            settings: self.settings,
+            temp_vectors: self.temp_vectors,
+            arena: self.arena,
+        })
     }
 
     pub fn mem_usage(&self) -> usize {
