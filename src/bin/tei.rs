@@ -85,7 +85,7 @@ pub fn main() {
     let mut komi = Komi::default();
     let mut multi_pv: usize = 1;
     let mut cumulative_search_time = Duration::ZERO;
-    let mut calculating_handle: Option<JoinHandle<(Box<dyn Any + Send>, Duration)>> = None;
+    let mut calculating_handle: Option<JoinHandle<(Option<Box<dyn Any + Send>>, Duration)>> = None;
     let should_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     for line in BufReader::new(io::stdin()).lines().map(Result::unwrap) {
@@ -237,7 +237,7 @@ pub fn main() {
 }
 
 fn build_mcts_settings<const S: usize>(is_slatebot: bool, is_cobblebot: bool) -> MctsSetting<S> {
-    if is_slatebot {
+    let mut s = if is_slatebot {
         MctsSetting::default()
             .add_rollout_depth(200)
             .add_rollout_temperature(0.2)
@@ -248,20 +248,29 @@ fn build_mcts_settings<const S: usize>(is_slatebot: bool, is_cobblebot: bool) ->
             .add_dirichlet(0.25)
     } else {
         MctsSetting::default()
+    };
+    // Optional override, primarily for testing arena-exhaustion handling.
+    // Value is megabytes; arena slots are 16 bytes each.
+    if let Ok(mb_str) = env::var("TILTAK_ARENA_SIZE_MB") {
+        if let Ok(mb) = mb_str.parse::<u32>() {
+            let slots = mb.saturating_mul(1024 * 1024 / 16);
+            s = s.arena_size(slots);
+        }
     }
+    s
 }
 
 /// Drain the worker if running, recovering the tree and the time it actually
 /// spent searching (used to advance `cumulative_search_time` monotonically
 /// across reused trees).
 fn drain_worker(
-    handle: &mut Option<JoinHandle<(Box<dyn Any + Send>, Duration)>>,
+    handle: &mut Option<JoinHandle<(Option<Box<dyn Any + Send>>, Duration)>>,
     search_tree: &mut Option<Box<dyn Any + Send>>,
     cumulative: &mut Duration,
 ) {
     if let Some(h) = handle.take() {
         let (tree_box, elapsed) = h.join().unwrap();
-        *search_tree = Some(tree_box);
+        *search_tree = tree_box;
         *cumulative += elapsed;
     }
 }
@@ -280,7 +289,7 @@ fn spawn_go<const S: usize>(
     is_cobblebot: bool,
     should_stop: Arc<AtomicBool>,
     multi_pv: usize,
-) -> JoinHandle<(Box<dyn Any + Send>, Duration)> {
+) -> JoinHandle<(Option<Box<dyn Any + Send>>, Duration)> {
     let mcts_settings: MctsSetting<S> = build_mcts_settings(is_slatebot, is_cobblebot);
     let cur_pos: SearchPosition<S> = position
         .as_ref()
@@ -337,7 +346,9 @@ fn spawn_go<const S: usize>(
             time_offset,
         );
         let elapsed = go_start.elapsed();
-        (Box::new(tree) as Box<dyn Any + Send>, elapsed)
+        let boxed: Option<Box<dyn Any + Send>> =
+            tree.map(|t| Box::new(t) as Box<dyn Any + Send>);
+        (boxed, elapsed)
     })
 }
 
@@ -444,11 +455,12 @@ fn run_go<const S: usize>(
     should_stop: Arc<AtomicBool>,
     multi_pv: usize,
     time_offset: Duration,
-) -> MonteCarloTree<S> {
+) -> Option<MonteCarloTree<S>> {
     let mut words = line.split_whitespace();
     words.next(); // go
 
     let visits_at_start = tree.visits();
+    let mut tree_exhausted = false;
 
     match words.next() {
         Some(word @ "movetime") | Some(word @ "infinite") => {
@@ -469,6 +481,7 @@ fn run_go<const S: usize>(
                     if let Err(err) = tree.select() {
                         eprintln!("Warning: {err}");
                         oom = true;
+                        tree_exhausted = true;
                         break;
                     }
                 }
@@ -520,16 +533,21 @@ fn run_go<const S: usize>(
 
             let start_time = Instant::now();
 
-            tree.search_for_time(max_time, |tree| {
-                print_search_info(
-                    tree,
-                    &position,
-                    start_time,
-                    time_offset,
-                    visits_at_start,
-                    multi_pv,
-                );
-            });
+            if tree
+                .search_for_time(max_time, |tree| {
+                    print_search_info(
+                        tree,
+                        &position,
+                        start_time,
+                        time_offset,
+                        visits_at_start,
+                        multi_pv,
+                    );
+                })
+                .is_err()
+            {
+                tree_exhausted = true;
+            }
             let best_move = tree.best_move().unwrap().0;
 
             println!("bestmove {}", position.move_to_san(&best_move));
@@ -539,6 +557,10 @@ fn run_go<const S: usize>(
         }
     }
 
-    tree
+    if tree_exhausted {
+        None
+    } else {
+        Some(tree)
+    }
 }
 

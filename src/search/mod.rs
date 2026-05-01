@@ -290,7 +290,7 @@ impl<const S: usize> MonteCarloTree<S> {
         }
     }
 
-    pub fn search_for_time<F>(&mut self, max_time: time::Duration, callback: F)
+    pub fn search_for_time<F>(&mut self, max_time: time::Duration, callback: F) -> Result<(), Error>
     where
         F: Fn(&Self),
     {
@@ -302,7 +302,7 @@ impl<const S: usize> MonteCarloTree<S> {
                 if let Err(err) = self.select() {
                     eprintln!("Warning: {err}");
                     callback(self);
-                    return;
+                    return Err(err);
                 };
             }
 
@@ -314,7 +314,7 @@ impl<const S: usize> MonteCarloTree<S> {
                 || shallow_edges.len() == 1
             {
                 callback(self);
-                return;
+                return Ok(());
             }
 
             shallow_edges.sort_by_key(|edge| edge.visits);
@@ -345,11 +345,12 @@ impl<const S: usize> MonteCarloTree<S> {
                 }) {
                     continue;
                 }
-                return;
+                return Ok(());
             } else if i % 2 == 0 {
                 callback(self);
             }
         }
+        Ok(())
     }
 
     // TODO: Count up to u64 on root?
@@ -565,7 +566,7 @@ pub fn play_move_time<const S: usize>(
     settings: MctsSetting<S>,
 ) -> (Move<S>, f32) {
     let mut tree = MonteCarloTree::new(board.clone(), settings);
-    tree.search_for_time(max_time, |_| {});
+    let _ = tree.search_for_time(max_time, |_| {});
     tree.best_move().unwrap()
 }
 
@@ -589,7 +590,7 @@ pub fn mcts_training<const S: usize>(
         }
         TimeControl::Time(time, increment) => {
             let max_time = *time / 5 + *increment / 2;
-            tree.search_for_time(max_time, |_| {});
+            let _ = tree.search_for_time(max_time, |_| {});
         }
     }
     let shallow_edges = tree.shallow_edges().unwrap();
