@@ -277,7 +277,8 @@ fn drain_worker(
 
 /// Build / reroot the search tree for the next `go` command and spawn the
 /// worker thread. Updates `last_searched` and resets `cumulative_search_time`
-/// when the tree had to be rebuilt.
+/// whenever the position has changed, so reported `time` only keeps climbing
+/// when the user re-issues `go` on the same position.
 #[allow(clippy::too_many_arguments)]
 fn spawn_go<const S: usize>(
     line: String,
@@ -306,15 +307,18 @@ fn spawn_go<const S: usize>(
         .and_then(|b| b.downcast::<SearchPosition<S>>().ok())
         .map(|b| *b);
 
-    let (tree, reused) = match (prev_tree, prev_pos) {
+    let (tree, same_position) = match (prev_tree, prev_pos) {
         (Some(t), Some(prev)) => match prev.move_difference(&cur_pos) {
-            Some(diff) => match t.reroot(diff) {
-                Some(t) => (t, true),
-                None => (
-                    MonteCarloTree::new(cur_pos.position(), mcts_settings.clone()),
-                    false,
-                ),
-            },
+            Some(diff) => {
+                let is_same = diff.is_empty();
+                match t.reroot(diff) {
+                    Some(t) => (t, is_same),
+                    None => (
+                        MonteCarloTree::new(cur_pos.position(), mcts_settings.clone()),
+                        false,
+                    ),
+                }
+            }
             None => (
                 MonteCarloTree::new(cur_pos.position(), mcts_settings.clone()),
                 false,
@@ -326,7 +330,7 @@ fn spawn_go<const S: usize>(
         ),
     };
 
-    if !reused {
+    if !same_position {
         *cumulative_search_time = Duration::ZERO;
     }
 
