@@ -70,6 +70,7 @@ pub fn main() {
     println!("id author Morten Lohne");
     println!("option name HalfKomi type spin default 0 min -10 max 10");
     println!("option name MultiPV type spin default 1 min 1 max 8");
+    println!("option name Hash type spin default 1024 min 16 max 32768");
     println!("teiok");
 
     // Size-erased state — concrete types depend on the current `size`.
@@ -84,6 +85,7 @@ pub fn main() {
     let mut size: Option<usize> = None;
     let mut komi = Komi::default();
     let mut multi_pv: usize = 1;
+    let mut hash_mb: u32 = 1024;
     let mut cumulative_search_time = Duration::ZERO;
     let mut calculating_handle: Option<JoinHandle<(Option<Box<dyn Any + Send>>, Duration)>> = None;
     let should_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -113,7 +115,10 @@ pub fn main() {
                     words.next().unwrap_or_default(),
                     words.next().unwrap_or_default(),
                 ];
-                if header != ["name", "HalfKomi"] && header != ["name", "MultiPV"] {
+                if header != ["name", "HalfKomi"]
+                    && header != ["name", "MultiPV"]
+                    && header != ["name", "Hash"]
+                {
                     panic!("Invalid setoption string \"{}\"", line);
                 }
                 let option_name = header[1];
@@ -137,6 +142,18 @@ pub fn main() {
                             multi_pv = n;
                         } else {
                             panic!("Invalid MultiPV setting \"{}\"", line);
+                        }
+                    }
+                    "Hash" => {
+                        // Bounds match the announced option range. Takes effect on
+                        // the next tree rebuild (teinewgame, non-descendant
+                        // position, or arena exhaustion); does not shrink an arena
+                        // that is already allocated.
+                        if let Some(mb) = value.parse::<u32>().ok().filter(|&mb| (16..=32768).contains(&mb))
+                        {
+                            hash_mb = mb;
+                        } else {
+                            panic!("Invalid Hash setting \"{}\"", line);
                         }
                     }
                     _ => unreachable!(),
@@ -193,6 +210,7 @@ pub fn main() {
                         is_cobblebot,
                         should_stop_clone,
                         multi_pv,
+                        hash_mb,
                     )),
                     Some(5) => Some(spawn_go::<5>(
                         line.clone(),
@@ -204,6 +222,7 @@ pub fn main() {
                         is_cobblebot,
                         should_stop_clone,
                         multi_pv,
+                        hash_mb,
                     )),
                     Some(6) => Some(spawn_go::<6>(
                         line.clone(),
@@ -215,6 +234,7 @@ pub fn main() {
                         is_cobblebot,
                         should_stop_clone,
                         multi_pv,
+                        hash_mb,
                     )),
                     Some(7) => Some(spawn_go::<7>(
                         line.clone(),
@@ -226,6 +246,7 @@ pub fn main() {
                         is_cobblebot,
                         should_stop_clone,
                         multi_pv,
+                        hash_mb,
                     )),
                     Some(s) => panic!("Error: Unsupported size {}", s),
                     None => panic!("Error: Received go without receiving teinewgame string"),
@@ -236,8 +257,12 @@ pub fn main() {
     }
 }
 
-fn build_mcts_settings<const S: usize>(is_slatebot: bool, is_cobblebot: bool) -> MctsSetting<S> {
-    let mut s = if is_slatebot {
+fn build_mcts_settings<const S: usize>(
+    is_slatebot: bool,
+    is_cobblebot: bool,
+    hash_mb: u32,
+) -> MctsSetting<S> {
+    let s = if is_slatebot {
         MctsSetting::default()
             .add_rollout_depth(200)
             .add_rollout_temperature(0.2)
@@ -249,15 +274,9 @@ fn build_mcts_settings<const S: usize>(is_slatebot: bool, is_cobblebot: bool) ->
     } else {
         MctsSetting::default()
     };
-    // Optional override, primarily for testing arena-exhaustion handling.
-    // Value is megabytes; arena slots are 16 bytes each.
-    if let Ok(mb_str) = env::var("TILTAK_ARENA_SIZE_MB") {
-        if let Ok(mb) = mb_str.parse::<u32>() {
-            let slots = mb.saturating_mul(1024 * 1024 / 16);
-            s = s.arena_size(slots);
-        }
-    }
-    s
+    // Hash MB caps the arena allocation; each slot is 16 bytes.
+    let slots = hash_mb.saturating_mul(1024 * 1024 / 16);
+    s.arena_size(slots)
 }
 
 /// Drain the worker if running, recovering the tree and the time it actually
@@ -290,8 +309,9 @@ fn spawn_go<const S: usize>(
     is_cobblebot: bool,
     should_stop: Arc<AtomicBool>,
     multi_pv: usize,
+    hash_mb: u32,
 ) -> JoinHandle<(Option<Box<dyn Any + Send>>, Duration)> {
-    let mcts_settings: MctsSetting<S> = build_mcts_settings(is_slatebot, is_cobblebot);
+    let mcts_settings: MctsSetting<S> = build_mcts_settings(is_slatebot, is_cobblebot, hash_mb);
     let cur_pos: SearchPosition<S> = position
         .as_ref()
         .and_then(|p| p.downcast_ref::<SearchPosition<S>>())
